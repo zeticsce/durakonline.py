@@ -1,14 +1,18 @@
 import base64
 import hashlib
 import json
+import typing
 from msgspec.json import decode
 from datetime import datetime
 from .utils import objects
 
+if typing.TYPE_CHECKING:
+    from . import Client
+
 
 class Authorization:
     def __init__(self, client, platform: str = "ios") -> None:
-        self.client = client
+        self.client: 'Client' = client
         self.platform = platform
         
     def get_session_key(self) -> objects.GetSessionKey:

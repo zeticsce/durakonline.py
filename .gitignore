@@ -2,3 +2,5 @@
 durakonline/__pycache__
 durakonline/utils/__pycache__
 test.py
+.eggs
+*egg-info

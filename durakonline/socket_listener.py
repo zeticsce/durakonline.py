@@ -5,8 +5,10 @@ import json
 import requests
 import threading
 import random
+import traceback
 from queue import Queue
 from durakonline.utils import Server
+import contextlib
 
 
 class SocketListener:
@@ -71,6 +73,10 @@ class SocketListener:
 
         return register_handler
 
+    def register_handler(self, command: str = "all", handler=None):
+        assert callable(handler)
+        self.handlers.setdefault(command, []).append(handler)
+        
     def error(self):
         def register_handler(handler):
             self.handlers["error"] = handler
@@ -118,7 +124,11 @@ class SocketListener:
                             for handler_command in self.handlers:
                                 if handler_command in ["all", command]:
                                     for handler in self.handlers[handler_command]:
-                                        handler(message)
+                                        try:
+                                            handler(message)
+                                        except Exception:
+                                            print(f'Exc in {handler!r}:\n', traceback.format_exc())
+
                             self.receive.put(message)
                     else:
                         continue
@@ -129,7 +139,12 @@ class SocketListener:
             _ = [x() for x in self.handlers.get('shutdown', [])]
 
     def listen(self):
-        response = self.receive.get(timeout=5)
+        try:
+            response = self.receive.get(timeout=5)
+        except Exception:
+            print(traceback.format_exc())
+            response = {'command': 'err'}
+
         return response
 
     def _get_data(self, command: str):
@@ -152,8 +167,9 @@ class SocketListener:
             self.thread.join()
             self.thread = None
         
-        if not self.receive.is_shutdown:
-            self.receive.shutdown()
+        with contextlib.suppress(AttributeError):
+            if not self.receive.is_shutdown:
+                self.receive.shutdown()
 
     def __del__(self) -> None:
         atexit.unregister(self.shutdown)
