@@ -42,6 +42,7 @@ class Client(SocketListener):
                 "base64": file
             }
         )
+        return self._get_data("uu")
 
     def get_user_info(self, user_id: int) -> objects.UserInfo:
         self.send_server(

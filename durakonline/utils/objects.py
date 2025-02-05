@@ -4,9 +4,13 @@ from .enums import Kind, Group
 
 
 class Err(Exception):
-    def __init__ (self, data:dir):
+    def __init__ (self, data: dict):
         self.json = data
         self.code = data.get("code", None)
+
+
+class ListenerError(Exception):
+    pass
 
 
 class FormatLanguage(Struct):

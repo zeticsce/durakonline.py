@@ -5,24 +5,33 @@ import json
 import requests
 import threading
 import random
-import traceback
 from queue import Queue
 from durakonline.utils import Server
 import contextlib
+from typing import Callable, TYPE_CHECKING, Any
+import logging
+
+
+if TYPE_CHECKING:
+    from .durakonline import Client
+
+
+logger = logging.getLogger(__name__)
 
 
 class SocketListener:
-    def __init__(self, client, proxy: str = ""):
+    def __init__(self: 'Client', client, proxy: str = ""):
         self.client = client
         self.proxy = proxy
         self.alive = False
         self.api_url: str = "http://static.rstgames.com/durak/"
-        self.socket = None
+        self.socket: socks.socksocket = None
         self.receive: Queue = Queue()
-        self.handlers = {}
-        self.thread = None
+        self.handlers: dict[str, list[Callable[[dict], ...]]] = {}
+        self.thread: threading.Thread = None
+        self.reconnection_data = {'interval': 3, 'limit': 5, 'lock': threading.Lock(), 'is_reconnected': False, 'terminated': False}
 
-    def create_connection(self, server_id: Server = None, ip: str = None, port: int = None):
+    def create_connection(self: 'Client', server_id: Server = None, ip: str = None, port: int = None):
         if not ip:
             servers = self.get_servers()["user"]
             server = servers[server_id] if server_id else list(random.choice(list(servers.items())))[1]
@@ -41,20 +50,60 @@ class SocketListener:
             if "error" in self.handlers:
                 self.handlers["error"](e)
             return
+        
+        if self.alive and self.thread:
+            self.alive = False
+            self.thread.join()
+
         self.alive = True
         self.thread = threading.Thread(target=self.receive_messages)
         self.thread.start()
 
-    def send_server(self, data: dir):
+    def send_server(self: 'Client', data: dict):
         if not self.socket:
             raise ValueError('Socket not created')
         try:
-            self.socket.send((data.pop('command')+json.dumps(data, separators=(',', ':')).replace("{}", '')+'\n').encode())
+            with self.reconnection_data['lock']:
+                self.socket.send(
+                    (
+                        data.pop('command') + json.dumps(data, separators=(',', ':')
+                    ).replace("{}", '')+'\n').encode()
+                )
+        except (ConnectionResetError, BrokenPipeError) as e:
+            if self.reconnection_data['terminated']:
+                raise e
+            
+            self.reconnect(e)
+            return self.send_server(data=data)
         except Exception as e:
+            logger.exception('')
             if "error" in self.handlers:
                 self.handlers["error"](e)
+    
+    def reconnect(self: 'Client') -> bool:
+        with self.reconnection_data['lock']:
+            if self.reconnection_data['is_reconnected']:
+                return False
+            
+            self.socket.close()
 
-    def get_servers(self) -> dict:
+            for count_reconn in range(limit := self.reconnection_data['limit']):
+                try:
+                    self.create_connection()
+                except Exception:
+                    logger.exception(
+                        f'Error while reconnecting to server ({count_reconn + 1} / {limit} attempts)'
+                    )
+                else:
+                    self.reconnection_data['is_reconnected'] = True
+                    logger.warning(
+                        f'Successfully reconnected to server for {count_reconn + 1} attempts'
+                    )
+                    return True
+            else:
+                logger.critical('Connection loss, out of attempts')
+
+    def get_servers(self: 'Client') -> dict:
         try:
             response = requests.get(f"{self.api_url}servers.json").json()
         except Exception as e:
@@ -63,28 +112,25 @@ class SocketListener:
             return
         return response
 
-    def event(self, command: str = "all"):
+    def event(self: 'Client', command: str = "all"):
         def register_handler(handler):
-            if command in self.handlers:
-                self.handlers[command].append(handler)
-            else:
-                self.handlers[command] = [handler]
+            self.handlers.setdefault('command', []).append(handler)
             return handler
 
         return register_handler
 
-    def register_handler(self, command: str = "all", handler=None):
+    def register_handler(self: 'Client', command: str = "all", handler: Callable[[dict], Any] = ...):
         assert callable(handler)
         self.handlers.setdefault(command, []).append(handler)
         
-    def error(self):
-        def register_handler(handler):
+    def error(self: 'Client'):
+        def register_handler(handler: Callable[[Exception], ...]):
             self.handlers["error"] = handler
             return handler
 
         return register_handler
 
-    def receive_messages(self):
+    def receive_messages(self: 'Client'):
         self.logger.debug(f"{self.tag}: Start listener")
         _ = [x() for x in self.handlers.get('init', [])]
 
@@ -98,8 +144,14 @@ class SocketListener:
                         break
                     if "error" in self.handlers:
                         self.handlers["error"](e)
-                    self.alive = False
-                    return
+
+                    if self.reconnection_data['terminated']:
+                        self.alive = False
+                        return
+                    
+                    self.reconnect()
+                    continue
+                
                 buffer = buffer + r
                 read = len(r)
                 if read != -1:
@@ -127,34 +179,38 @@ class SocketListener:
                                         try:
                                             handler(message)
                                         except Exception:
-                                            print(f'Exc in {handler!r}:\n', traceback.format_exc())
+                                            self.logger.exception(f'Exc in {handler!r}:\n')
 
                             self.receive.put(message)
                     else:
                         continue
                 else:
-                    self.socket.close()
-                    return
+                    if self.reconnection_data['terminated']:
+                        self.socket.close()
+                        return
+                    
+                    self.reconnect()
+                    continue
 
             _ = [x() for x in self.handlers.get('shutdown', [])]
 
-    def listen(self):
+    def listen(self: 'Client'):
         try:
-            response = self.receive.get(timeout=5)
+            response = self.receive.get(timeout=15)
         except Exception:
-            print(traceback.format_exc())
+            logger.exception('Error while receive response')
             response = {'command': 'err'}
 
         return response
 
-    def _get_data(self, command: str):
+    def _get_data(self: 'Client', command: str):
         data = self.listen()
         while True:
             if data["command"] in [command, "err", "alert"]:
                 return data
             data = self.listen()
     
-    def shutdown(self) -> None:
+    def shutdown(self: 'Client') -> None:
         if self.alive:
             self.alive = False
 
@@ -171,5 +227,5 @@ class SocketListener:
             if not self.receive.is_shutdown:
                 self.receive.shutdown()
 
-    def __del__(self) -> None:
+    def __del__(self: 'Client') -> None:
         atexit.unregister(self.shutdown)
